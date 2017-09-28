@@ -10,6 +10,4 @@ pip install tornado
 
 python server.py
 
-でサーバーを立ち上げてからアクセスしてください。
-
-http://localhost:9095/show_video_graph.html
+でサーバーを立ち上げてからブラウザでアクセスしてください。
