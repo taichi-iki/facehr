@@ -1,0 +1,424 @@
+<!DOCTYPE html>
+<html>
+	<head>
+		<meta charset="UTF-8"/>
+		<title>Face tracking heart rate monitor</title>
+	</head>
+	<body>
+		<h2>Face tracking heart rate monitor</h2>
+		<video id="videoMain" autoplay="true" style="display:none"></video>
+		<canvas id ="canvasMain"></canvas>
+		<br/><button id="buttonStop">Stop</button>(refresh page to restart)
+		<br/><button onclick="showSignal = !showSignal">signal</button>
+		<button onclick="showFilteredSignal = !showFilteredSignal">filtered</button>
+		<button onclick="loggingEnabled = !loggingEnabled">logging</button>
+		<br/>
+		<textarea id="textArea" style="width:500px"></textarea>
+	</body>
+	<script src="clmtrackr.js"></script>
+	<script src="model_spca_20_svm.js"></script>
+	<script type='text/javascript'>
+		//
+		// Face tracking heart rate monitor sample 
+		// 2016-12-13 written by Taichi Iki(taichi.iki at nextremer.com)
+		//
+		// requirement
+		// clmtrackr.js (numeric.solve)
+		//
+		// contains
+		// 0. utils
+		// 1. heart rate model
+		// 2. User interface and event handling
+
+		//////////////////////////////////////////////////
+		// 0. utils
+		var chRed=0, chGreen=1, chBlue=2, chAlpha=3
+		var averageImageData = function(imageData){
+			var sum = [0.0, 0.0, 0.0, 0.0]
+			for(var i=0; i<imageData.data.length; i+=4){
+				sum[chRed] += imageData.data[i+chRed]
+				sum[chGreen] += imageData.data[i+chGreen]
+				sum[chBlue] += imageData.data[i+chBlue]
+				sum[chAlpha] += imageData.data[i+chAlpha]
+			}
+			var factor = 1.0/(255.0*imageData.width*imageData.height)
+			return sum.map(x=>x*factor)
+		}
+
+		var RGBArray2RGBA = (arr, alpha)=>"rgba("+arr[0]+","+arr[1]+","+arr[2]+","+alpha+")"
+		
+		//////////////////////////////////////////////////
+		// 1. heart rate model
+		var HREstimator = function(nSignalSource=1, nHistoryMax=200, basePlusWidth=300, minimumPeakInterval=250, fitWindowWidth=undefined, logging=undefined){
+			this.nSignalSource = nSignalSource
+			this.nHistoryMax = nHistoryMax
+			this.basePlusWidth = basePlusWidth
+			this.fitWindowWidth = (fitWindowWidth===undefined ? basePlusWidth *2: fitWindowWidth)
+			this.minimumPeakInterval = minimumPeakInterval
+			this.logging = logging
+
+			// data history
+			// [singalSoruceId][timeId] -> [time, signal]
+			this.hSignal = Array.from({length:nSignalSource}).map(x=>[])
+			this.hFilteredSignal = Array.from({length:nSignalSource}).map(x=>[])
+			this.hBeatTiming = Array.from({length:nSignalSource}).map(x=>[])
+			this.lastPeak = Array.from({length:nSignalSource}).map(x=>undefined)
+			this.heartRate = Array.from({length:nSignalSource}).map(x=>undefined)
+			this.pushWithLimit = function(h, l, x){
+				if(h.length >= l) h.pop()
+				h.unshift(x)
+			}
+
+			// correlation between base functio and signal time series
+			// h: time series of single source 
+			this.baseTimeWidth = basePlusWidth/3.0
+			this.filter = [
+				[1, -1.0, +0.0],
+				[2, +0.0, -1.0],
+				[3, +1.0, -3.0],
+				[4, +2.0, -6.0],
+				[5, +0.0, +2.0],
+				[6, -2.0, +12.0],
+				[7, -1.0, +6.0],
+				[8, +0.0, -1.0],
+				[9, +1.0, -9.0],
+			]
+			this.filterCount = this.filter.length
+			this.apllyFilter = function(h){
+				var baseTime = h[0][0]
+				var fpointer = 0
+				var w = [[6, -1], [18,+1], [24,-1]]
+				var c = w[fpointer]
+				var v = 0.0
+				var i
+				for(i=0; i<h.length; i++){
+					t = (baseTime - h[i][0])/this.baseTimeWidth
+					if(i >= c[0]){
+						fpointer += 1
+						if(fpointer >= w.length) break
+							c = w[fpointer]
+						//ft=this.filter[fpointer][0]
+						//fa=this.filter[fpointer][1]
+						//fb=this.filter[fpointer][2] 
+					}
+					
+					v += c[1] * h[i][1] 
+				}
+				//console.log(i)
+				// return [baseTime, 0.001*v*this.filterCount*this.baseTimeWidth/i]
+				return [baseTime, v]
+			}
+
+			this.apllyFilter = function(h){
+				var baseTime = h[0][0]
+				var fpointer = 0
+				var ft=this.filter[fpointer][0], fa=this.filter[fpointer][1], fb=this.filter[fpointer][2] 
+				var v = 0.0
+				var i
+				for(i=0; i<h.length; i++){
+					t = (baseTime - h[i][0])/this.baseTimeWidth
+					if(t >= ft){
+						fpointer += 1
+						if(fpointer >= this.filterCount) break
+						ft=this.filter[fpointer][0]
+						fa=this.filter[fpointer][1]
+						fb=this.filter[fpointer][2] 
+					}
+					
+					v += (fa*t + fb) * h[i][1] 
+				}
+				console.log(i)
+				// return [baseTime, 0.001*v*this.filterCount*this.baseTimeWidth/i]
+				return [baseTime, v/i]
+			}
+
+			// pushing signals into history
+			this.pushSignal = function(t, s){
+				for(var signalSourceId=0; signalSourceId<nSignalSource; signalSourceId+=1){
+					this.pushWithLimit(this.hSignal[signalSourceId], this.nHistoryMax, [t, s[signalSourceId]])
+					var x = this.apllyFilter(this.hSignal[signalSourceId])
+					this.pushWithLimit(this.hFilteredSignal[signalSourceId], this.nHistoryMax, x)
+					var peak = this.fit(model.hFilteredSignal[signalSourceId], 2*basePlusWidth)
+					if(peak[0]){
+						if(this.lastPeak[signalSourceId] !== undefined){
+							var dt = peak[1] - this.lastPeak[signalSourceId][1]
+							if(dt > this.minimumPeakInterval){
+								// new beat detected
+								// time, heart rate, dt, height
+								var beatInfo = {time:peak[1], heartRate:60000.0/dt, dt:dt, height:peak[2]}
+								this.pushWithLimit(this.hBeatTiming[signalSourceId], this.nHistoryMax, beatInfo)
+								this.lastPeak[signalSourceId] = peak
+								this.heartRate[signalSourceId] = beatInfo.heartRate
+								if(this.logging !== undefined) this.logging(signalSourceId, beatInfo)
+							}
+						}
+						else{
+							this.lastPeak[signalSourceId] = peak
+						}
+					}
+				}
+			}
+
+			// calculate a parabolic curve that have the minimum mean square error on signal
+			//note: w in millisecond
+			this.fit = function(h, w){
+				var T = [0.0 ,0.0, 0.0, 0.0, 0.0]
+				var Y = [0.0, 0.0, 0.0]
+				var baseTime = h[0][0]
+				for(var i=0; i<h.length; i++){
+					var tInMS = baseTime - h[i][0]
+					if(tInMS > w) break
+					var t = tInMS/1000.0
+					var t2 = t*t
+					Y[0] += h[i][1]
+					Y[1] += h[i][1] * t
+					Y[2] += h[i][1] * t2
+					T[0] += 1
+					T[1] += t
+					T[2] += t2
+					T[3] += t*t2
+					T[4] += t2*t2
+					//console.log(t +", "+h[i][1])
+				}
+				
+				var n = T[0]
+				if(n==0) return undefined
+				// a2, a1, a0
+				var x = numeric.solve([[T[4], T[3], T[2]], [T[3], T[2], T[1]], [T[2], T[1], T[0]]],[Y[2], Y[1], Y[0]])
+				var detected = false, peakTime, peakHeight
+				if(x[0] < 0){
+					peakTime = 1000*(-0.5*x[1]/x[0])
+					peakHeight = x[2]-0.25*x[1]*x[1]/(x[0])
+					if(peakTime > 0 && peakTime < w && peakHeight > 0) detected = true
+				}
+				return [detected, baseTime - peakTime, peakHeight]
+			}
+		}
+
+		//////////////////////////////////////////////////
+		// 2. User interface and event handling
+		// model parameters and variables used by model
+		var pm = {}
+		pm.desiredTimeInterval = 40
+		pm.lastDrawLoopTime = undefined
+		pm.fitWindowWidth = 800
+		pm.roi = [[250,240,40,40], [0,0,1,1]] //, [0,0,1,1], [0,0,1,1]] 
+		pm.roiColor = [[0, 255, 0], [0, 0, 0]] //, [0, 0, 0], [0, 0, 0]]
+		// debug
+		// pm.roi = [[300,230,20,20]] 
+		// pm.roiColor = [[0, 255, 0]]
+		// pm.roi = [[0,0,1,1], [0,0,1,1], [0,0,1,1]] 
+		// pm.roiColor = [[0, 0, 0], [0, 0, 0], [0, 0, 0]]
+		//
+		pm.roiCount = pm.roi.length
+		pm.lastFilteredSignalMax = Array.from({length:pm.roiCount}).map(x=>1.0)
+		pm.lastSignalDeltaMax = Array.from({length:pm.roiCount}).map(x=>0.5)
+		pm.lastSignalAverage = Array.from({length:pm.roiCount}).map(x=>0.5)
+		pm.lastDaqRate = 0
+		pm.faceParam = undefined
+		pm.faceScore = 0
+
+		var model = new HREstimator(pm.roiCount)
+		var tracker = new clm.tracker() 
+		tracker.init(pModel)
+
+		// html elements
+		var videoMain = document.getElementById("videoMain")
+		var canvasMain = document.getElementById("canvasMain")
+		var canvasMainContext = canvasMain.getContext("2d")
+		var textArea = document.getElementById("textArea")
+		var videoStopped = false
+		var showFilteredSignal = true
+		var showSignal = true
+		model.logging = function(signalSourceId, beatInfo){
+			if(!loggingEnabled) return
+			textArea.innerHTML += beatInfo.time + "\t" + (pm.faceParam !== undefined) + "\t" + signalSourceId + "\t" + beatInfo.heartRate + "\n"
+		}
+		var loggingEnabled = false
+		var trackerEnabled = true
+
+		// repeatedly called after video stream has been loaded
+		function drawLoop(){
+        	if(!videoStopped) requestAnimationFrame(drawLoop)
+        	// fetching camera view and collect data on rois
+        	var currentTime = (new Date()).getTime()
+        	canvasMainContext.clearRect(0, 0, canvasMain.width, canvasMain.height)
+        	canvasMainContext.drawImage(videoMain, 0,0)
+
+        	if(trackerEnabled && tracker.track(videoMain)){
+        		var pos = tracker.getCurrentPosition()
+              	pm.roi[1] = [pos[62][0]-25, pos[62][1]-25, 50, 50]
+              	
+              	/*var x = [0,0]
+              	for(var i=0; i<2 ; i++) x[i] = pos[62][i] + 3*(pos[42][i] - pos[62][i])
+              	pm.roi[2] = [x[0]-10, x[1]-10, 20, 20]
+
+              	x = [0,0]
+              	for(var i=0; i<2 ; i++) x[i] = pos[62][i] + 3*(pos[43][i] - pos[62][i])
+              	pm.roi[3] = [x[0]-10, x[1]-10, 20, 20]
+              */
+
+          		pm.faceScore = tracker.getScore()
+          		var newFaceParam = Array.from(tracker.getCurrentParameters())
+          		pm.faceParam = newFaceParam
+        	}
+        	else{
+        		pm.faceParam = undefined
+        	}
+
+        	if(pm.lastDrawLoopTime === undefined || currentTime - pm.lastDrawLoopTime > pm.desiredTimeInterval){
+        		// console.log(currentTime - pm.lastDrawLoopTime)
+        		var pixelAverage = pm.roi.map(r => averageImageData(canvasMainContext.getImageData(r[0], r[1], r[2], r[3]))[chGreen])
+        		model.pushSignal(currentTime, pixelAverage)
+        		pm.lastDaqRate = 1000.0 / (currentTime - pm.lastDrawLoopTime)
+        		pm.lastDrawLoopTime = currentTime
+        	}
+
+        	// drawing other information
+        	var baseLineHeight = canvasMain.clientHeight * 0.5
+        	var canvasWidth = canvasMain.clientWidth
+        	var dw = canvasWidth / (pm.desiredTimeInterval * model.nHistoryMax)
+        	var gamma = 0.6
+        	var pxFont = 15
+        	var printCount = 0
+        	var printString = function(s){
+        		printCount += 1
+        		canvasMainContext.fillText(s, 0, printCount*pxFont)
+        	}
+        	canvasMainContext.font = pxFont+"px Georgia"
+        	canvasMainContext.fillStyle = "#000000"
+        	canvasMainContext.strokeStyle="#000000"
+
+        	// heart rate
+        	var hrs = Array.from(model.heartRate)
+        	hrs.sort((x, y)=>x-y)
+        	printString("estimated heart Rate[bps]="+Math.round(hrs[0]))
+
+        	// detected face
+        	canvasMainContext.fillStyle = "rgba(0, 0, 0, 1.0)"
+        	if(pm.faceParam !== undefined){
+        		tracker.draw(canvasMain, pm.faceParam)
+        		canvasMainContext.lineWidth = 1.0
+        		canvasMainContext.fillStyle = "rgba(0, 0, 0, 1.0)"
+        		printString("Face score=" +  pm.faceScore.toFixed(2))
+        	}
+        	else{
+        		canvasMainContext.fillStyle = "rgba(0, 0, 0, 1.0)"
+        		printString("Face score=NA")
+        	}
+        	
+        	// region of interest
+        	canvasMainContext.lineWidth = 2.0
+        	for(var showROIId=0; showROIId<pm.roiCount; showROIId++){
+        		var r = pm.roi[showROIId]
+        		canvasMainContext.strokeStyle = RGBArray2RGBA(pm.roiColor[showROIId], 1)
+        		canvasMainContext.strokeRect(r[0], r[1], r[2], r[3])
+        	}
+
+        	// DAQ rate
+        	canvasMainContext.fillStyle = "rgba(0, 0, 0, 1.0)"
+        	printString("DAQ rate[1/s]=" +  pm.lastDaqRate.toFixed(2))
+
+        	// baseLine
+        	canvasMainContext.strokeStyle="#AAAAAA"
+        	canvasMainContext.strokeRect(0, baseLineHeight, canvasWidth, 1)
+
+        	// peak fit window
+        	canvasMainContext.fillStyle = "rgba(0, 0, 0, 0.3)"
+        	canvasMainContext.fillRect(canvasWidth - dw*model.fitWindowWidth, 0, dw*model.fitWindowWidth, 2*baseLineHeight)
+
+        	// graph of each roi
+        	for(var showROIId=0; showROIId<pm.roiCount; showROIId++){
+        		canvasMainContext.strokeStyle=RGBArray2RGBA(pm.roiColor[showROIId], 0.6)
+        		canvasMainContext.fillStyle=RGBArray2RGBA(pm.roiColor[showROIId], 0.6)
+        		canvasMainContext.lineWidth = 1.0
+        		// signal
+        		h = model.hSignal[showROIId]
+        		if(h.length > 0 && showSignal){
+        			//pm.lastSignalAverage[showROIId] = 0.5
+        			//pm.lastSignalDeltaMax[showROIId] = 0.3
+        			var baseTime = h[0][0]
+        			canvasMainContext.beginPath()
+        			var delta = h[0][1]-pm.lastSignalAverage[showROIId]
+        			canvasMainContext.moveTo(canvasWidth ,baseLineHeight*(1.0 - delta/pm.lastSignalDeltaMax[showROIId]))
+        			var lastSignalAverage = h[0][1]
+        			var lastSignalDeltaMax = Math.abs(delta)
+        			for(var tId=1; tId<h.length; tId++){
+        				delta = h[tId][1]-pm.lastSignalAverage[showROIId]
+        				canvasMainContext.lineTo(canvasWidth - dw*(baseTime - h[tId][0]), baseLineHeight*(1.0 - delta/pm.lastSignalDeltaMax[showROIId]))
+        				if(lastSignalDeltaMax < Math.abs(delta)) lastSignalDeltaMax = Math.abs(delta)
+        				lastSignalAverage += h[tId][1]
+        			}
+        			lastSignalAverage /= h.length
+        			if(lastSignalDeltaMax<1e-8) lastSignalDeltaMax = 1e-8
+        			pm.lastSignalAverage[showROIId] = gamma*pm.lastSignalAverage[showROIId] + (1.0-gamma) * lastSignalAverage
+        			pm.lastSignalDeltaMax[showROIId] = gamma*pm.lastSignalDeltaMax[showROIId] + (1.0-gamma) * lastSignalDeltaMax
+        			canvasMainContext.stroke()
+        			canvasMainContext.strokeStyle=RGBArray2RGBA(pm.roiColor[showROIId], 1)
+        			canvasMainContext.fillStyle=RGBArray2RGBA(pm.roiColor[showROIId], 1)
+        			printString("G ch: amp_max=" + pm.lastSignalDeltaMax[showROIId].toFixed(3) + ", average=" + pm.lastSignalAverage[showROIId].toFixed(3))
+        		}
+
+        		// filtered signal
+        		canvasMainContext.lineWidth = 2.0
+        		h = model.hFilteredSignal[showROIId]
+        		if(h.length > 0 && showFilteredSignal){
+        			var baseTime = h[0][0]
+        			canvasMainContext.beginPath()
+        			canvasMainContext.moveTo(canvasWidth ,baseLineHeight*(1.0 - h[0][1]))
+        			var lastFilteredSignalMax = Math.abs(h[0][1])
+        			for(var tId=1; tId<h.length; tId++){
+        				canvasMainContext.lineTo(canvasWidth - dw*(baseTime - h[tId][0]), baseLineHeight*(1.0 - h[tId][1]/pm.lastFilteredSignalMax[showROIId]))
+        				if(lastFilteredSignalMax < Math.abs(h[tId][1])) lastFilteredSignalMax = Math.abs(h[tId][1])
+        			}
+        			pm.lastFilteredSignalMax[showROIId] = gamma*pm.lastFilteredSignalMax[showROIId] + (1.0-gamma) * lastFilteredSignalMax
+        			canvasMainContext.stroke()
+        			canvasMainContext.lineWidth = 1.0
+        			printString("filtered(bold): amp_max=" +  pm.lastFilteredSignalMax[showROIId].toFixed(3))
+
+        			// beat timing
+        			h = model.hBeatTiming[showROIId]
+        			for(var tId=0; tId<h.length; tId++){
+        				canvasMainContext.fillRect(canvasWidth - dw*(baseTime - h[tId].time)-1, baseLineHeight-50, 2, 100)
+        			}
+        		}
+        		// latest heart rate
+        		var ss = "latest heart rates="
+        		if(h.length>0) ss += Math.round(h[0].heartRate) //+ "(" + h[0].height.toFixed(5) + ")"
+        		if(h.length>1) ss += ", " + Math.round(h[1].heartRate) //+ "(" + h[1].height.toFixed(5) + ")"
+        		printString(ss)
+        		canvasMainContext.lineWidth = 1.0
+        	}
+        }
+
+		// checking media api
+		window.URL = window.URL || window.webkitURL
+    	navigator.getUserMedia = navigator.getUserMedia || navigator.webkitGetUserMedia || navigator.mozGetUserMedia || navigator.msGetUserMedia
+    	if(!navigator.getUserMedia){
+      		alert("Video error: getUserMedia support needed")
+    	}
+    	else{
+    		// get video stream
+      		navigator.getUserMedia(
+          		{audio: false, video: true},
+          		function(localMediaStream) {
+              		videoMain.src = window.URL.createObjectURL(localMediaStream)
+              		videoMain.onloadedmetadata = function () {
+                		videoMain.width = videoMain.videoWidth
+                		videoMain.height = videoMain.videoHeight
+                		canvasMain.width = videoMain.videoWidth
+                		canvasMain.height = videoMain.videoHeight
+                		document.getElementById("buttonStop").onclick = function(ev){
+                			videoStopped = true
+                			localMediaStream.getVideoTracks()[0].stop()
+                		}
+                		drawLoop()
+              		}
+            	},
+          		function(err) {
+              		alert("Video error: getUserMedia failed" + err)
+            	}
+        	)
+    	}
+	</script>
+</html>
